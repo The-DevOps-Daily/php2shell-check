@@ -1,0 +1,16 @@
+# 2026-10-21T18:30:37Z scripts/compare-hub-index.py joomla:latest nextcloud:latest nextcloud:fpm phpmyadmin:latest yourls:latest
+joomla:latest
+  hub tags API amd64: sha256:9594a6ab1e22  8.4.26 built 2026-10-21T01:52:43
+  registry index amd64: same digest
+nextcloud:latest
+  hub tags API amd64: sha256:b2de54764f1c  8.5.12 built 2026-10-21T18:01:44
+  registry index amd64: same digest
+nextcloud:fpm
+  hub tags API amd64: sha256:68f26a79a1a0  8.5.12 built 2026-10-21T18:04:57
+  registry index amd64: same digest
+phpmyadmin:latest
+  hub tags API amd64: sha256:e2aea900f260  8.3.35 built 2026-10-21T01:26:30
+  registry index amd64: same digest
+yourls:latest
+  hub tags API amd64: sha256:fa6da2370c7b  8.5.11 built 2026-10-21T01:27:05
+  registry index amd64: same digest

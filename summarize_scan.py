@@ -11,28 +11,32 @@ import datetime
 import glob
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from php2shell_check import classify_upstream  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The release was scheduled for 14:00 UTC (php.net, 20 October 2026).
 RELEASE = datetime.datetime(2026, 10, 21, 14, 0, 0)
+TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?$")
 
 
 def ts(s):
-    if not s:
+    """RFC 3339 timestamp -> naive UTC datetime, or None."""
+    m = TS_RE.match((s or "").strip())
+    if not m:
         return None
-    s = s.rstrip("Z")
-    if "." in s:
-        head, frac = s.split(".", 1)
-        s = head + "." + frac[:6]
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.datetime.strptime(s, fmt)
-        except ValueError:
-            pass
-    return None
+    t = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+    if m.group(2):
+        t += datetime.timedelta(microseconds=int((m.group(2) + "000000")[:6]))
+    tz = m.group(3)
+    if tz and tz != "Z":
+        sign = 1 if tz[0] == "+" else -1
+        hh, mm = int(tz[1:3]), int(tz[-2:])
+        t -= sign * datetime.timedelta(hours=hh, minutes=mm)
+    return t
 
 
 def status(rec):
@@ -68,35 +72,36 @@ def main(argv=None):
         for r in run["records"]:
             counts[status(r)] = counts.get(status(r), 0) + 1
         start = ts(run["started_utc"])
+        if start is None:
+            sys.exit("refusing %s: bad started_utc" % run["_file"])
         hours = (start - RELEASE).total_seconds() / 3600
-        print("  %s  started %s (release +%.1f h)  %d images: %s" % (
+        print("  %s  started %s (scheduled release +%.1f h)  %d images: %s" % (
             run["_file"], run["started_utc"], hours, len(run["records"]),
             ", ".join("%s %d" % kv for kv in sorted(counts.items()))))
         print("      code %s / %s, images list %s" % (
             run["code_sha256"]["registry_scan.py"][:12], run["code_sha256"]["php2shell_check.py"][:12],
             run["images_sha256"][:12]))
 
-    print("\nImages (status and PHP version per run; built = image config 'created')")
-    refs = []
+    print("\nImages (status, metadata PHP version and image build time per run)")
+    keys = []
     for run in runs:
         for r in run["records"]:
-            if r["ref"] not in refs:
-                refs.append(r["ref"])
-    for ref in refs:
+            key = (r["ref"], r.get("platform"))
+            if key not in keys:
+                keys.append(key)
+    for ref, platform in keys:
         cells = []
-        built = None
         for run in runs:
-            rec = next((r for r in run["records"] if r["ref"] == ref), None)
+            rec = next((r for r in run["records"] if (r["ref"], r.get("platform")) == (ref, platform)), None)
             if rec is None:
                 cells.append("-")
                 continue
-            cells.append("%s %s" % (status(rec), rec.get("php_version") or "?"))
-            built = rec.get("config_created") or built
-        b = ts(built)
-        delta = ""
-        if b and b >= RELEASE:
-            delta = " (release +%.1f h)" % ((b - RELEASE).total_seconds() / 3600)
-        print("  %-36s %s  built %s%s" % (ref, " | ".join("%-18s" % c for c in cells), (built or "?")[:16], delta))
+            b = ts(rec.get("config_created"))
+            built = b.strftime("%m-%d %H:%M") if b else "?"
+            if b and b >= RELEASE:
+                built += " (+%.1f h)" % ((b - RELEASE).total_seconds() / 3600)
+            cells.append("%s %s, built %s" % (status(rec), rec.get("php_version") or "?", built))
+        print("  %-34s %s" % ("%s [%s]" % (ref, platform), " | ".join("%-44s" % c for c in cells)))
 
     last = runs[-1]
     patched_after = []
@@ -108,7 +113,7 @@ def main(argv=None):
         patched_after.sort()
         mid = patched_after[len(patched_after) // 2] if len(patched_after) % 2 else \
             (patched_after[len(patched_after) // 2 - 1] + patched_after[len(patched_after) // 2]) / 2
-        print("\nPatched images built after the release in the last run: %d, built %.1f to %.1f h after it (median %.1f h)"
+        print("\nPatched images built after the scheduled release, last run: %d, built %.1f to %.1f h after it (median %.1f h)"
               % (len(patched_after), patched_after[0], patched_after[-1], mid))
 
     if args.chart:

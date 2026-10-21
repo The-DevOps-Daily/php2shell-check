@@ -1,4 +1,4 @@
-# 2026-10-21T18:26:09Z Raspberry Pi, Debian 12, PHP CLI from packages.sury.org, no web server, run as a normal user
+# 2026-10-21T18:39:09Z Raspberry Pi, Debian 12, PHP CLI from packages.sury.org, no web server, run as a normal user
 $ python3 php2shell_check.py
 php2shell-check: fixed releases 8.2.35, 8.3.36, 8.4.27, 8.5.12
 
@@ -17,7 +17,7 @@ Running PHP processes
 
 Containers
   none checked
-note: no docker or podman CLI found; container processes are still listed under processes
+note: no docker or podman CLI found; container processes are judged by the version in /proc
 
 result: VULNERABLE or restart needed (exit 1)
 $ echo $?

@@ -61,11 +61,14 @@ LIB_GLOBS = [
     "/usr/lib/libphp*.so", "/usr/lib64/libphp*.so", "/usr/local/lib/libphp*.so",
     "/usr/lib/*-linux-gnu/libphp*.so",
 ]
-NAME_RE = re.compile(r"^(php(-fpm|-cgi)?[0-9.]*|lsphp[0-9.]*|frankenphp)$")
-PROC_RE = re.compile(r"(^|/)(php(-fpm|-cgi)?[0-9.]*|lsphp[0-9.]*|frankenphp|apache2|httpd)(\s|:|$)")
+# php, php8.4, php84, php-fpm, php-fpm8.4, php84-fpm, php-cgi8.4, lsphp84, frankenphp
+NAME_RE = re.compile(r"^(php[0-9.]*(-fpm|-cgi)?[0-9.]*|lsphp[0-9.]*|frankenphp)$")
+PROC_RE = re.compile(r"(^|/)(php[0-9.]*(-fpm|-cgi)?[0-9.]*|lsphp[0-9.]*|frankenphp|apache2|httpd)(\s|:|$)")
 VERSION_STRING_RE = re.compile(rb"X-Powered-By: PHP/([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.~+-]*)")
 DASH_V_RE = re.compile(r"(?m)^(?:PHP|FrankenPHP \S+ PHP) ([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.~+-]*)")
-PRERELEASE_RE = re.compile(r"(?i)^-?(dev|alpha|beta|rc)")
+PRERELEASE_RE = re.compile(r"(?i)^[-~._]?(dev|alpha|beta|rc|a[0-9]|b[0-9])")
+# Suffixes distributions append to PHP_VERSION, e.g. -0ubuntu0.18.04.17 or +deb12u1.
+DISTRO_SUFFIX_RE = re.compile(r"^([-+~][0-9]|\+|-[0-9A-Za-z.+~]*(ubuntu|deb|el[0-9]|sury))")
 CONTAINER_ID_RE = re.compile(r"([0-9a-f]{64})")
 
 
@@ -86,6 +89,8 @@ def classify_upstream(version_text):
         return UNKNOWN, "no PHP version found"
     if PRERELEASE_RE.match(suffix):
         return UNKNOWN, "pre-release build %s: check the commit it was built from" % version_text
+    if suffix and not DISTRO_SUFFIX_RE.match(suffix):
+        return UNKNOWN, "unrecognised version suffix in %s" % version_text
     branch = version[:2]
     if branch in FIXED:
         fixed = FIXED[branch]
@@ -191,15 +196,19 @@ def static_version(path):
     """Read the PHP version compiled into a binary or libphp without running it."""
     try:
         with open(path, "rb") as f:
-            tail = b""
+            buf = b""
             while True:
                 chunk = f.read(4 << 20)
-                if not chunk:
+                eof = not chunk
+                buf += chunk
+                m = VERSION_STRING_RE.search(buf)
+                # A match that touches the end of the buffer may be cut off
+                # (8.4.27 + RC1 in the next chunk); read on before accepting it.
+                if m and (eof or m.end() < len(buf)):
+                    return m.group(1).decode()
+                if eof:
                     return None
-                found = scan_version_bytes(tail + chunk)
-                if found:
-                    return found
-                tail = chunk[-64:]
+                buf = buf[-128:]
     except OSError:
         return None
 
@@ -330,9 +339,33 @@ def server_overrides(runner):
     return found
 
 
+def file_matches_package(runner, manager, pkg, path):
+    """False when the package manager says this file differs from the package
+    (for example an older binary copied over a package-owned path), True when
+    it verifies, None when verification could not run."""
+    if manager == "dpkg":
+        rc, out, _ = runner.run(["dpkg", "--verify", pkg])
+    elif manager == "rpm":
+        rc, out, _ = runner.run(["rpm", "-Vf", path])
+    else:
+        return None
+    if rc not in (0, 1):
+        return None
+    for line in out.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if parts and parts[-1] == path and "5" in parts[0]:
+            return False
+    return True if rc == 0 or out else None
+
+
+def changelog_hits(text):
+    return [cve for cve, ids in VULNS.items() if any(i in text for i in ids)]
+
+
 def package_evidence(runner, path):
     """Which distro package owns `path`, its version, and whether its changelog
-    names the CVE or GHSA IDs."""
+    names the CVE or GHSA IDs. `trusted` is only set when the changelog
+    belongs to the installed package and the file matches the package."""
     rc, out, _ = runner.run(["dpkg-query", "-S", path])
     if rc == 0:
         pkg = None
@@ -345,8 +378,11 @@ def package_evidence(runner, path):
                 break
         if pkg:
             rc, ver, _ = runner.run(["dpkg-query", "-W", "-f=${Version}", pkg])
-            version = ver.decode().strip() if rc == 0 else None
-            ev = {"manager": "dpkg", "package": pkg, "version": version, "hits": [], "trusted": False}
+            version = ver.decode("utf-8", "replace").strip() if rc == 0 else ""
+            ev = {"manager": "dpkg", "package": pkg, "version": version or None, "hits": [], "trusted": False}
+            if not version:
+                ev["note"] = "installed version of %s unknown" % pkg
+                return ev
             doc = "/usr/share/doc/%s/changelog.Debian.gz" % pkg.split(":")[0]
             data = runner.read(doc)
             if data is None:
@@ -358,17 +394,20 @@ def package_evidence(runner, path):
                 ev["note"] = "unreadable %s" % doc
                 return ev
             m = re.match(r"^\S+ \(([^)]+)\)", text)
-            top = m.group(1) if m else None
+            top = m.group(1) if m else ""
+            ev["hits"] = changelog_hits(text)
             # /usr/share/doc/<pkg> is often a symlink to another package's
             # docs; after a partial upgrade that changelog can be newer than
             # the binary. Only trust it when its top entry is this version.
-            if top != version:
-                ev["note"] = "changelog top entry %s does not match installed %s" % (top, version)
+            if not top or top != version:
+                ev["note"] = "changelog top entry %s does not match installed %s" % (top or "?", version)
+                return ev
+            if file_matches_package(runner, "dpkg", pkg, path) is False:
+                ev["note"] = "%s differs from the %s package (dpkg --verify)" % (path, pkg)
                 return ev
             ev["trusted"] = True
-            ev["hits"] = [cve for cve, ids in VULNS.items() if any(i in text for i in ids)]
             return ev
-    rc, out, _ = runner.run(["rpm", "-qf", "--qf", "%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n", path])
+    rc, out, _ = runner.run(["rpm", "-qf", "--qf", "%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n", path])
     if rc == 0 and out.strip():
         lines = out.decode("utf-8", "replace").strip().splitlines()
         name, _, version = lines[0].partition("\t")
@@ -376,30 +415,37 @@ def package_evidence(runner, path):
         if len(lines) > 1:
             ev["note"] = "file owned by %d packages" % len(lines)
             return ev
-        rc, log, _ = runner.run(["rpm", "-q", "--changelog", "%s-%s" % (name, version.split(":", 1)[-1])])
+        # -qf with --changelog reads the header of the package that owns this
+        # file, so another epoch or architecture of the same name cannot mix in.
+        rc, log, _ = runner.run(["rpm", "-qf", "--changelog", path])
         if rc != 0:
             ev["note"] = "rpm changelog not readable"
             return ev
-        text = log.decode("utf-8", "replace")
+        ev["hits"] = changelog_hits(log.decode("utf-8", "replace"))
+        if file_matches_package(runner, "rpm", name, path) is False:
+            ev["note"] = "%s differs from the %s package (rpm -V)" % (path, name)
+            return ev
         ev["trusted"] = True
-        ev["hits"] = [cve for cve, ids in VULNS.items() if any(i in text for i in ids)]
         return ev
     rc, out, _ = runner.run(["apk", "info", "--who-owns", path])
     if rc == 0 and b"is owned by" in out:
-        owner = out.decode().strip().rsplit(" ", 1)[-1]
+        owner = out.decode("utf-8", "replace").strip().rsplit(" ", 1)[-1]
         return {"manager": "apk", "package": owner, "version": owner, "hits": [], "trusted": False,
                 "note": "apk keeps no changelog; upstream version decides"}
     return None
 
 
-def check_binary(runner, path, sapi, static=True):
+def read_embedded_version(runner, path):
+    if isinstance(runner, HostRunner):
+        return static_version(runner.path(path))
+    return scan_version_bytes(runner.read(path))
+
+
+def check_binary(runner, path, sapi, embedded=True):
     item = {"where": runner.label, "path": path, "sapi": sapi, "exposure": EXPOSURE.get(sapi, "")}
     version = None
-    if static and isinstance(runner, HostRunner):
-        version = static_version(runner.path(path))
-        item["version_source"] = "embedded string"
-    elif not static:
-        version = scan_version_bytes(runner.read(path))
+    if embedded:
+        version = read_embedded_version(runner, path)
         item["version_source"] = "embedded string"
     if version is None and sapi not in ("apache2handler", "embed") and runner.can_exec(path):
         version = dash_v(runner, path, sapi)
@@ -450,9 +496,9 @@ def sapi_for(path):
     name = os.path.basename(path)
     if name.startswith("libphp"):
         return "apache2handler" if ("apache" in path or "httpd" in path) else "embed"
-    if name.startswith("php-fpm"):
+    if re.match(r"^php[0-9.]*-fpm", name):
         return "fpm"
-    if name.startswith("php-cgi"):
+    if re.match(r"^php[0-9.]*-cgi", name):
         return "cgi"
     if name.startswith("lsphp"):
         return "litespeed"
@@ -495,10 +541,19 @@ def modphp_enabled(runner, libpath):
 
 # ---------------------------------------------------------------- processes
 
+def file_identity(path):
+    try:
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
 def scan_processes(proc="/proc"):
     """Running PHP processes, including those inside containers. A process whose
     binary or libphp shows '(deleted)' still runs the code from before the
-    last upgrade."""
+    last upgrade. Processes that cannot be fully inspected are counted, not
+    dropped."""
     groups = {}
     denied = 0
     for pid in sorted(os.listdir(proc), key=lambda s: int(s) if s.isdigit() else 0):
@@ -509,30 +564,31 @@ def scan_processes(proc="/proc"):
             with open(os.path.join(base, "comm")) as f:
                 comm = f.read().strip()
         except OSError:
-            continue
+            continue  # the process exited
         try:
             exe = os.readlink(os.path.join(base, "exe"))
         except OSError:
             exe = None
         name = os.path.basename((exe or "").replace(" (deleted)", "")) or comm
-        candidate = PROC_RE.search(name) or PROC_RE.search(comm)
-        if not candidate:
+        if not (PROC_RE.search(name) or PROC_RE.search(comm)):
             continue
         if exe is None:
             denied += 1
             continue
-        lib, lib_deleted = None, False
+        is_web_server = bool(re.search(r"^(apache2|httpd)", name))
+        libs = []
         try:
             with open(os.path.join(base, "maps")) as f:
                 for line in f:
                     if "libphp" in line:
-                        lib = line.split(None, 5)[-1].strip()
-                        lib_deleted = lib.endswith("(deleted)")
-                        break
+                        parts = line.split(None, 5)
+                        if len(parts) == 6 and parts[5].strip() not in libs:
+                            libs.append(parts[5].strip())
         except OSError:
-            pass
-        is_web_server = re.search(r"^(apache2|httpd)", name)
-        if is_web_server and lib is None:
+            if is_web_server:
+                denied += 1  # cannot tell whether this Apache loads PHP
+                continue
+        if is_web_server and not libs:
             continue
         container = None
         try:
@@ -540,16 +596,27 @@ def scan_processes(proc="/proc"):
                 m = CONTAINER_ID_RE.search(f.read())
                 container = m.group(1)[:12] if m else None
         except OSError:
-            pass
-        key = (container, exe, lib)
-        g = groups.setdefault(key, {"container": container, "exe": exe, "libphp": lib, "pids": [],
-                                    "deleted": exe.endswith(" (deleted)") or lib_deleted})
-        g["pids"].append(int(pid))
-        if "version" not in g:
+            container = "?"
+        lib = libs[0] if libs else None
+        lib_deleted = any(l.endswith("(deleted)") for l in libs)
+        if lib and not lib_deleted:
+            lib_id = file_identity(os.path.join(base, "root") + lib) or \
+                (file_identity(lib) if container is None else None)
+        else:
+            lib_id = None
+        exe_id = file_identity(os.path.join(base, "exe"))
+        key = (container, exe, tuple(libs), exe_id, lib_id)
+        g = groups.get(key)
+        if g is None:
             target = os.path.join(base, "exe")
-            if lib and not lib_deleted and container is None:
-                target = lib
-            g["version"] = static_version(target)
+            if lib and not lib_deleted:
+                root_lib = os.path.join(base, "root") + lib
+                target = root_lib if os.path.exists(root_lib) else (lib if container is None else None)
+            g = groups[key] = {"container": container, "exe": exe, "libphp": lib, "libs": libs, "pids": [],
+                               "deleted": exe.endswith(" (deleted)") or lib_deleted,
+                               "exe_id": exe_id, "lib_id": lib_id,
+                               "version": static_version(target) if target else None}
+        g["pids"].append(int(pid))
     return list(groups.values()), denied
 
 
@@ -565,62 +632,74 @@ def container_runtime(requested):
 
 
 CONTAINER_FIND = (
-    "for f in php php-fpm php-cgi frankenphp lsphp; do command -v $f; done 2>/dev/null; "
-    "ls /usr/sbin/php-fpm* /usr/local/sbin/php-fpm* /usr/bin/php[0-9]* /usr/sbin/php-fpm[0-9]* "
-    "/usr/lib/apache2/modules/libphp*.so /usr/lib64/httpd/modules/libphp*.so "
-    "/usr/local/apache2/modules/libphp*.so 2>/dev/null; true"
+    "ls -1d /usr/bin/* /usr/sbin/* /usr/local/bin/* /usr/local/sbin/* /bin/* /sbin/* /usr/lib/cgi-bin/* "
+    "/opt/*/bin/* /opt/*/sbin/* /opt/*/*/bin/* /opt/*/*/sbin/* /usr/local/lsws/*/bin/* "
+    "/usr/lib/apache2/modules/libphp*.so /usr/lib64/httpd/modules/libphp*.so /usr/lib/httpd/modules/libphp*.so "
+    "/usr/local/apache2/modules/libphp*.so /usr/local/lib/libphp*.so /usr/lib/libphp*.so 2>/dev/null; true"
 )
 
 
+def process_name(cmd):
+    first = cmd.split()[0] if cmd.split() else ""
+    return os.path.basename(first).rstrip(":")
+
+
+WORST = {PATCHED: 0, UNKNOWN: 1, VULNERABLE: 2, STALE: 3}
+
+
 def check_containers(host, runtime):
-    results, notes = [], []
+    results = []
     rc, out, err = host.run([runtime, "ps", "--format", "{{.ID}}\t{{.Image}}\t{{.Names}}"])
     if rc != 0:
         return [{"where": "containers", "status": UNKNOWN,
-                 "reason": "%s ps failed: %s" % (runtime, err.decode("utf-8", "replace").strip()[:200])}], notes
+                 "reason": "%s ps failed: %s" % (runtime, err.decode("utf-8", "replace").strip()[:200])}]
     rows = [l.split("\t") for l in out.decode("utf-8", "replace").splitlines() if l.strip()]
     for row in rows:
         cid, image, name = (row + ["", "", ""])[:3]
+        base = {"where": "container", "container": name, "container_id": cid, "image": image}
         rc, top, _ = host.run([runtime, "top", cid])
+        if rc != 0:
+            results.append(dict(base, status=UNKNOWN, reason="%s top failed" % runtime))
+            continue
         cmds = []
         for line in top.decode("utf-8", "replace").splitlines()[1:]:
             parts = line.split(None, 7)
             cmds.append(parts[7] if len(parts) == 8 else line)
-        php_cmds = [c for c in cmds if PROC_RE.search(c.split()[0] if c.split() else "")]
-        if rc != 0:
-            results.append({"where": "container", "container": name, "image": image, "status": UNKNOWN,
-                            "reason": "%s top failed" % runtime})
-            continue
-        if not php_cmds:
+        procs = sorted(set(process_name(c) for c in cmds if PROC_RE.search(process_name(c))))
+        if not procs:
             continue
         cr = ContainerRunner(runtime, cid, host)
         rc, found, _ = cr.run(["sh", "-c", CONTAINER_FIND])
         paths = []
-        if rc == 0:
-            for p in found.decode("utf-8", "replace").split():
-                rc2, real, _ = cr.run(["readlink", "-f", p])
-                real = real.decode().strip() if rc2 == 0 and real.strip() else p
-                if real not in paths:
-                    paths.append(real)
-        env_rc, env, _ = host.run([runtime, "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", cid])
+        for p in found.decode("utf-8", "replace").split() if rc == 0 else []:
+            b = os.path.basename(p)
+            if not (NAME_RE.match(b) or re.match(r"^libphp[0-9.]*\.so$", b)):
+                continue
+            rc2, real, _ = cr.run(["readlink", "-f", p])
+            real = real.decode("utf-8", "replace").strip() if rc2 == 0 and real.strip() else p
+            if real not in paths:
+                paths.append(real)
+        _, env, _ = host.run([runtime, "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", cid])
         image_php = None
         for line in env.decode("utf-8", "replace").splitlines():
             if line.startswith("PHP_VERSION="):
                 image_php = line.split("=", 1)[1]
-        if not paths:
-            results.append({"where": "container", "container": name, "image": image, "status": UNKNOWN,
-                            "reason": "PHP processes running (%s) but no PHP binary found via exec"
-                                      % ", ".join(sorted(set(c.split()[0] for c in php_cmds)))[:200],
-                            "image_env_PHP_VERSION": image_php})
-            continue
+        base.update({"image_env_PHP_VERSION": image_php, "processes": procs})
+        checked = []
         for p in paths:
             sapi = sapi_for(p)
-            item = check_binary(cr, p, sapi, static=sapi in ("apache2handler", "embed"))
-            item.update({"container": name, "container_id": cid, "image": image,
-                         "image_env_PHP_VERSION": image_php,
-                         "processes": sorted(set(c.split()[0] for c in php_cmds))})
-            results.append(item)
-    return results, notes
+            item = check_binary(cr, p, sapi, embedded=sapi in ("apache2handler", "embed"))
+            item.update(base)
+            checked.append(item)
+        results.extend(checked)
+        # Every PHP process must be covered by a checked binary of its kind.
+        have = set(i["sapi"] for i in checked)
+        for proc_name in procs:
+            want = "apache2handler" if re.match(r"^(apache2|httpd)", proc_name) else sapi_for(proc_name)
+            if want not in have:
+                results.append(dict(base, status=UNKNOWN,
+                                    reason="process %s runs but no %s binary was found to check" % (proc_name, want)))
+    return results
 
 
 # ---------------------------------------------------------------- report
@@ -629,9 +708,57 @@ def overall(items):
     statuses = [i.get("status") for i in items]
     if VULNERABLE in statuses or STALE in statuses:
         return 1
-    if UNKNOWN in statuses:
+    if any(s != PATCHED for s in statuses):
         return 2
     return 0
+
+
+def resolve_processes(report, groups, denied, root, containers_checked):
+    prefix = root.rstrip("/")
+    disk = {}
+    for item in report["items"]:
+        ident = file_identity(item["path"] if not prefix else prefix + item["path"])
+        if ident:
+            disk[ident] = item
+    by_container = {}
+    for c in report.get("containers", []):
+        if c.get("container_id"):
+            by_container.setdefault(c["container_id"][:12], []).append(c)
+    for g in groups:
+        entry = {k: v for k, v in g.items() if k not in ("exe_id", "lib_id")}
+        entry["where"] = "process"
+        ident = g["lib_id"] if g["libphp"] else g["exe_id"]
+        observed, observed_reason = classify_upstream(g.get("version"))
+        if g["deleted"]:
+            entry["status"] = STALE
+            entry["reason"] = "running binary was replaced on disk: restart these processes"
+        elif g["container"] == "?":
+            entry["status"] = UNKNOWN
+            entry["reason"] = "could not read the cgroup: host or container unknown"
+        elif g["container"]:
+            items = [i for cid, lst in by_container.items() if cid.startswith(g["container"]) for i in lst]
+            if items:
+                worst = max(items, key=lambda i: WORST.get(i["status"], 1))
+                entry["status"] = worst["status"]
+                entry["reason"] = "container check: %s" % worst["reason"]
+            elif g.get("version"):
+                entry["status"] = observed
+                entry["reason"] = "%s (version read from /proc; container not checked%s)" % (
+                    observed_reason, "" if containers_checked else ", no docker/podman")
+            else:
+                entry["status"] = UNKNOWN
+                entry["reason"] = "container process not checked and version not readable"
+        elif ident and ident in disk:
+            entry["status"] = disk[ident]["status"]
+            entry["reason"] = "same file as %s" % disk[ident]["path"]
+        else:
+            entry["status"] = observed if observed != PATCHED or g.get("version") else UNKNOWN
+            entry["reason"] = "%s (running file not matched to a checked file on disk)" % observed_reason
+        report["processes"].append(entry)
+    if denied:
+        report["notes"].append("%d PHP-like processes could not be inspected (run as root to include them)" % denied)
+        report["processes"].append({"where": "process", "status": UNKNOWN,
+                                    "reason": "%d processes not readable without root" % denied})
 
 
 def run(args):
@@ -647,49 +774,24 @@ def run(args):
         report["items"].append(item)
     report["server_overrides"] = server_overrides(host)
 
-    if not args.no_processes:
-        groups, denied = scan_processes(args.proc)
-        disk = {i["path"]: i for i in report["items"]}
-        prefix = args.root.rstrip("/")
-        for g in groups:
-            exe = (g["exe"] or "").replace(" (deleted)", "")
-            lib = g["libphp"]
-            if prefix and exe.startswith(prefix + "/"):
-                exe = exe[len(prefix):]
-            if prefix and lib and lib.startswith(prefix + "/"):
-                lib = lib[len(prefix):]
-            entry = dict(g)
-            entry["where"] = "process"
-            if g["deleted"]:
-                entry["status"] = STALE
-                entry["reason"] = "running binary was replaced on disk: restart these processes"
-            elif g["container"]:
-                entry["status"] = "see container"
-                entry["reason"] = "checked in the container section"
-            elif (lib or exe) in disk:
-                entry["status"] = disk[lib or exe]["status"]
-                entry["reason"] = "same file as %s" % (lib or exe)
-            else:
-                entry["status"], entry["reason"] = classify_upstream(g.get("version"))
-            report["processes"].append(entry)
-        if denied:
-            report["notes"].append("%d PHP-like processes could not be inspected (run as root to include them)" % denied)
-            report["processes"].append({"where": "process", "status": UNKNOWN,
-                                        "reason": "%d processes not readable without root" % denied})
-
+    containers_checked = False
     if not args.no_containers:
         rt = container_runtime(args.runtime)
         if rt:
-            items, notes = check_containers(host, rt)
-            report["containers"] = items
-            report["notes"] += notes
+            report["containers"] = check_containers(host, rt)
+            containers_checked = True
         else:
             report["containers"] = []
-            report["notes"].append("no docker or podman CLI found; container processes are still listed under processes")
+            report["notes"].append("no docker or podman CLI found; container processes are judged by the version in /proc")
+
+    if not args.no_processes:
+        groups, denied = scan_processes(args.proc)
+        resolve_processes(report, groups, denied, args.root, containers_checked)
 
     all_items = report["items"] + report["processes"] + report.get("containers", [])
     report["exit_code"] = overall(all_items)
-    if not report["items"] and not report["processes"] and not report.get("containers"):
+    report["found_php"] = bool(all_items)
+    if not all_items:
         report["notes"].append("no PHP found in the searched locations")
     return report
 
@@ -763,7 +865,12 @@ def print_report(r):
     for n in r["notes"]:
         w("note: %s" % n)
     w("")
-    w("result: %s (exit %d)" % ({0: "all patched", 1: "VULNERABLE or restart needed", 2: "could not check everything"}[r["exit_code"]], r["exit_code"]))
+    if r["exit_code"] == 0 and not r.get("found_php"):
+        verdict = "no PHP found in the searched locations"
+    else:
+        verdict = {0: "every PHP found is patched", 1: "VULNERABLE or restart needed",
+                   2: "could not check everything"}[r["exit_code"]]
+    w("result: %s (exit %d)" % (verdict, r["exit_code"]))
     return "\n".join(out)
 
 

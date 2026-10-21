@@ -29,7 +29,8 @@ class ClassifyUpstream(unittest.TestCase):
         self.check("8.4.27-1+ubuntu24.04.1+deb.sury.org+1", c.PATCHED)
 
     def test_prereleases_and_partial_versions_are_unknown(self):
-        for v in ("8.6.0RC3", "8.4.27-dev", "8.5.12alpha1", "8.4", "", None):
+        for v in ("8.6.0RC3", "8.4.27-dev", "8.5.12alpha1", "8.4.27~rc1", "8.4.27.rc1", "8.4.27RC1",
+                  "8.4.27-custom", "8.4", "", None):
             self.check(v, c.UNKNOWN)
 
     def test_newer_branch_is_unknown(self):
@@ -79,6 +80,20 @@ class PhpInfo(unittest.TestCase):
         info = c.parse_phpinfo(html)
         self.assertEqual(info["session.upload_progress.enabled"], "On")
         self.assertEqual(info["_loaded_ini"], "/etc/php.ini")
+
+    def test_version_split_across_a_read_chunk(self):
+        import tempfile
+        d = tempfile.mkdtemp(prefix="php2shell-chunk-")
+        try:
+            marker = b"X-Powered-By: PHP/8.4.27"
+            path = os.path.join(d, "bin")
+            with open(path, "wb") as f:
+                f.write(b"\0" * ((4 << 20) - len(marker)) + marker + b"RC1\0tail")
+            self.assertEqual(c.static_version(path), "8.4.27RC1")
+            self.assertEqual(c.classify_upstream(c.static_version(path))[0], c.UNKNOWN)
+        finally:
+            import shutil
+            shutil.rmtree(d)
 
     def test_embedded_version_string(self):
         blob = b"\x00\x01junk X-Powered-By: PHP/8.3.6\x00more"

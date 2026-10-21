@@ -17,6 +17,12 @@ class ParseRef(unittest.TestCase):
         self.assertEqual(rs.parse_ref("ghcr.io/org/app:1.2"), ("ghcr.io", "org/app", "1.2"))
         self.assertEqual(rs.parse_ref("localhost:5000/app"), ("localhost:5000", "app", "latest"))
 
+    def test_digest_refs_from_kubectl(self):
+        d = "sha256:" + "a" * 64
+        self.assertEqual(rs.parse_ref("docker.io/library/php@" + d), ("registry-1.docker.io", "library/php", d))
+        self.assertEqual(rs.parse_ref("php:8.4-fpm@" + d), ("registry-1.docker.io", "library/php", d))
+        self.assertEqual(rs.parse_ref("docker-pullable://ghcr.io/org/app@" + d), ("ghcr.io", "org/app", d))
+
 
 class VersionFromConfig(unittest.TestCase):
     def cfg(self, env=(), labels=None):
@@ -47,18 +53,20 @@ class ScanOne(unittest.TestCase):
     def tearDown(self):
         rs.http_get = self.orig
 
-    def fake(self, config_bytes, claimed_digest=None):
+    def fake(self, config_bytes, claimed_digest=None, manifest_tamper=False):
         digest = claimed_digest or "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+        manifest = json.dumps({"config": {"digest": digest}}).encode()
+        self.amd = "sha256:" + hashlib.sha256(manifest).hexdigest()
         hub = {"tag_last_pushed": "2026-10-21T17:30:05Z",
-               "images": [{"os": "linux", "architecture": "arm64", "digest": "sha256:arm"},
-                          {"os": "linux", "architecture": "amd64", "digest": "sha256:amd", "last_pushed": "x"}]}
-        manifest = {"config": {"digest": digest}}
+               "images": [{"os": "linux", "architecture": "arm64", "variant": "v8", "digest": "sha256:" + "1" * 64},
+                          {"os": "linux", "architecture": "amd64", "digest": self.amd, "last_pushed": "x"}]}
+        served = manifest + (b" " if manifest_tamper else b"")
 
         def http_get(url, headers=None, timeout=30):
             if url.startswith("https://hub.docker.com/"):
                 return 200, {}, json.dumps(hub).encode()
-            if "manifests/sha256:amd" in url:
-                return 200, {}, json.dumps(manifest).encode()
+            if url.endswith("manifests/" + self.amd):
+                return 200, {}, served
             if "/blobs/" in url:
                 return 200, {}, config_bytes
             return 404, {}, b""
@@ -68,7 +76,30 @@ class ScanOne(unittest.TestCase):
         cfg = json.dumps({"created": "2026-10-21T15:54:31Z", "config": {"Env": ["PHP_VERSION=8.4.27"]}}).encode()
         self.fake(cfg)
         rec = rs.scan_one("php:8.4-fpm", "linux/amd64")
-        self.assertEqual((rec["php_version"], rec["status"], rec["manifest_digest"]), ("8.4.27", "patched", "sha256:amd"))
+        self.assertEqual((rec["php_version"], rec["status"], rec["manifest_digest"]), ("8.4.27", "patched", self.amd))
+
+    def test_refuses_manifest_with_wrong_digest(self):
+        cfg = json.dumps({"config": {"Env": ["PHP_VERSION=8.4.27"]}}).encode()
+        self.fake(cfg, manifest_tamper=True)
+        rec = rs.scan_one("php:8.4-fpm", "linux/amd64")
+        self.assertIn("digest mismatch", rec["error"])
+
+    def test_refuses_config_for_another_platform(self):
+        cfg = json.dumps({"os": "linux", "architecture": "arm64", "config": {"Env": ["PHP_VERSION=8.4.27"]}}).encode()
+        self.fake(cfg)
+        rec = rs.scan_one("php:8.4-fpm", "linux/amd64")
+        self.assertIn("not linux/amd64", rec["error"])
+
+    def test_platform_variants(self):
+        entries = [{"platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}, "digest": "a"},
+                   {"platform": {"os": "linux", "architecture": "amd64"}, "digest": "b"},
+                   {"platform": {"os": "linux", "architecture": "arm", "variant": "v6"}, "digest": "c"},
+                   {"platform": {"os": "linux", "architecture": "arm", "variant": "v7"}, "digest": "d"}]
+        self.assertEqual(rs.pick_platform(entries, "linux/arm64")["digest"], "a")
+        self.assertEqual(rs.pick_platform(entries, "linux/arm64/v8")["digest"], "a")
+        self.assertEqual(rs.pick_platform(entries, "linux/amd64")["digest"], "b")
+        self.assertEqual(rs.pick_platform(entries, "linux/arm/v7")["digest"], "d")
+        self.assertIsNone(rs.pick_platform(entries, "linux/arm"))  # ambiguous
 
     def test_refuses_config_with_wrong_digest(self):
         cfg = json.dumps({"config": {"Env": ["PHP_VERSION=8.4.27"]}}).encode()

@@ -50,7 +50,7 @@ class Scenario(object):
         for d in (self.root, self.bin, self.proc):
             os.makedirs(d)
         self.table = []
-        for tool in ("dpkg-query", "rpm", "apk", "docker", "podman"):
+        for tool in ("dpkg-query", "dpkg", "rpm", "apk", "docker", "podman"):
             self._wrapper(os.path.join(self.bin, tool), "shim")
 
     def _wrapper(self, path, marker):
@@ -169,6 +169,21 @@ class HostTests(unittest.TestCase):
         self.noble("8.3.6-0ubuntu0.24.04.13", "  * GHSA-w8hw-w9fx-j79w\n  * GHSA-6wmf-4rv5-p3rp\n")
         self.assertEqual(self.item(self.s.run(), "/usr/bin/php8.3")["status"], c.PATCHED)
 
+    def test_binary_that_differs_from_its_package_is_not_trusted(self):
+        # An older binary copied over the path of a patched package.
+        self.noble("8.3.6-0ubuntu0.24.04.13", BOTH_CVES)
+        self.s.answer("dpkg --verify php8.3-cli", "??5??????   /usr/bin/php8.3\n", code=1)
+        i = self.item(self.s.run(), "/usr/bin/php8.3")
+        self.assertEqual(i["status"], c.VULNERABLE)
+        self.assertIn("differs", i["reason"])
+
+    def test_unknown_installed_version_is_not_trusted(self):
+        self.s.php("/usr/bin/php8.3", "8.3.6")
+        self.s.answer("dpkg-query -S /usr/bin/php8.3", "php8.3-cli: /usr/bin/php8.3\n")
+        self.s.file("/usr/share/doc/php8.3-cli/changelog.Debian.gz", gzip.compress(BOTH_CVES.encode()))
+        i = self.item(self.s.run(), "/usr/bin/php8.3")
+        self.assertEqual(i["status"], c.VULNERABLE)
+
     def test_stripped_docs_leave_a_vulnerable_version_vulnerable(self):
         self.s.php("/usr/bin/php8.3", "8.3.6")
         self.s.dpkg("/usr/bin/php8.3", "php8.3-cli", "8.3.6-0ubuntu0.24.04.13")  # no changelog file
@@ -178,10 +193,11 @@ class HostTests(unittest.TestCase):
 
     def test_rhel_rpm_backport(self):
         self.s.php("/usr/bin/php", "7.4.33")
-        nvr = "0:7.4.33-8.module+el8.10.0+25117+30337cca"
+        nvr = "0:7.4.33-8.module+el8.10.0+25117+30337cca.x86_64"
         self.s.answer("rpm -qf --qf * /usr/bin/php", "php-cli\t%s\n" % nvr)
-        self.s.answer("rpm -q --changelog php-cli-7.4.33-8.module+el8.10.0+25117+30337cca",
+        self.s.answer("rpm -qf --changelog /usr/bin/php",
                       "* Wed Oct 21 2026 Packager - 7.4.33-8\n- fix CVE-2026-109618\n- fix CVE-2026-109619\n")
+        self.s.answer("rpm -Vf /usr/bin/php", "")
         i = self.item(self.s.run(), "/usr/bin/php")
         self.assertEqual(i["status"], c.PATCHED)
         self.assertEqual(i["package"]["manager"], "rpm")
@@ -241,7 +257,15 @@ class HostTests(unittest.TestCase):
     def test_nothing_found(self):
         r = self.s.run()
         self.assertEqual(r["exit_code"], 0)
-        self.assertIn("no PHP found in the searched locations", r["notes"])
+        self.assertFalse(r["found_php"])
+        self.assertIn("no PHP found in the searched locations", c.print_report(r))
+
+    def test_alternative_binary_names_are_found(self):
+        self.s.php("/usr/sbin/php84-fpm", "8.4.26")
+        self.s.php("/usr/bin/php83", "8.3.36")
+        r = self.s.run()
+        self.assertEqual(self.item(r, "/usr/sbin/php84-fpm")["sapi"], "fpm")
+        self.assertEqual(self.item(r, "/usr/bin/php83")["status"], c.PATCHED)
 
     # -- running processes -----------------------------------------------------
 
@@ -264,12 +288,49 @@ class HostTests(unittest.TestCase):
         self.s.process(901, "apache2", "/usr/sbin/apache2", maps="7f00-7f10 r-xp 0 08:01 1 /usr/lib/libc.so.6\n")
         self.assertEqual(self.s.run(processes=True)["processes"], [])
 
-    def test_container_process_is_left_to_the_container_check(self):
+    def test_container_process_without_a_container_check_is_not_a_pass(self):
         cid = "a" * 64
         self.s.process(1000, "php-fpm", "/usr/local/sbin/php-fpm", cgroup="0::/system.slice/docker-%s.scope\n" % cid)
         r = self.s.run(processes=True)
         self.assertEqual(r["processes"][0]["container"], "a" * 12)
-        self.assertEqual(r["processes"][0]["status"], "see container")
+        self.assertEqual(r["processes"][0]["status"], c.UNKNOWN)
+        self.assertEqual(r["exit_code"], 2)
+
+    def test_container_process_judged_by_version_in_proc(self):
+        # e.g. a Kubernetes node with containerd and no docker CLI
+        binary = self.s.php("/srv/k8s/php-fpm-copy", "8.4.26")
+        self.s.process(1001, "php-fpm", binary, cgroup="0::/kubepods/pod1/cri-containerd-%s.scope\n" % ("b" * 64))
+        r = self.s.run(processes=True)
+        self.assertEqual(r["processes"][0]["status"], c.VULNERABLE)
+        self.assertEqual(r["exit_code"], 1)
+
+    def test_host_process_on_a_different_file_is_judged_by_its_own_version(self):
+        self.s.php("/usr/sbin/php-fpm8.4", "8.4.27")
+        other = os.path.join(self._tmp, "elsewhere", "php-fpm8.4")
+        os.makedirs(os.path.dirname(other))
+        with open(other, "w") as f:
+            f.write("# X-Powered-By: PHP/8.4.26\n")
+        self.s.process(1002, "php-fpm8.4", other)
+        r = self.s.run(processes=True)
+        self.assertEqual(self.item(r, "/usr/sbin/php-fpm8.4")["status"], c.PATCHED)
+        self.assertEqual(r["processes"][0]["status"], c.VULNERABLE)
+        self.assertEqual(r["exit_code"], 1)
+
+    def test_host_process_on_the_checked_file_inherits_its_verdict(self):
+        binary = self.s.php("/usr/sbin/php-fpm8.4", "8.4.27")
+        self.s.process(1003, "php-fpm8.4", binary)
+        r = self.s.run(processes=True)
+        self.assertEqual(r["processes"][0]["status"], c.PATCHED)
+        self.assertIn("same file", r["processes"][0]["reason"])
+        self.assertEqual(r["exit_code"], 0)
+
+    def test_apache_with_unreadable_maps_is_unknown(self):
+        self.s.process(1004, "apache2", "/usr/sbin/apache2")
+        os.chmod(os.path.join(self.s.proc, "1004", "maps"), 0)
+        if os.access(os.path.join(self.s.proc, "1004", "maps"), os.R_OK):
+            self.skipTest("running as root: permissions are not enforced")
+        r = self.s.run(processes=True)
+        self.assertEqual(r["exit_code"], 2)
 
     # -- containers ------------------------------------------------------------
 
@@ -299,6 +360,18 @@ class HostTests(unittest.TestCase):
         self.assertEqual(by["new-app"], {c.PATCHED})
         self.assertNotIn("proxy", by)
         self.assertEqual(r["exit_code"], 1)
+
+    def test_container_process_without_a_matching_binary_is_unknown(self):
+        s = self.s
+        s.answer("docker ps --format *", "c4\tcustom:1\tapp\n")
+        s.answer("docker top c4", "UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 10:00 ? 00:00:00 php-fpm: master process (/etc/fpm.conf)\n")
+        s.answer("docker exec c4 sh -c *", "/usr/bin/php8.4\n/usr/bin/ls\n")
+        s.answer("docker exec c4 readlink -f /usr/bin/php8.4", "/usr/bin/php8.4\n")
+        s.answer("docker exec c4 /usr/bin/php8.4 -v", "PHP 8.4.27 (cli)\n")
+        r = s.run(containers=True)
+        statuses = sorted(i["status"] for i in r["containers"])
+        self.assertEqual(statuses, [c.PATCHED, c.UNKNOWN])
+        self.assertEqual(r["exit_code"], 2)
 
     def test_container_listing_failure_is_unknown(self):
         self.s.answer("docker ps --format *", "", code=1)

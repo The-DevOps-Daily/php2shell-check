@@ -39,9 +39,10 @@
   ],
   "processes": [],
   "notes": [
-    "no docker or podman CLI found; container processes are still listed under processes"
+    "no docker or podman CLI found; container processes are judged by the version in /proc"
   ],
   "server_overrides": [],
   "containers": [],
-  "exit_code": 1
+  "exit_code": 1,
+  "found_php": true
 }
