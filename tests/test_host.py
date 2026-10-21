@@ -59,7 +59,8 @@ class Scenario(object):
         os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     def answer(self, pattern, out="", code=0):
-        self.table.append([pattern, code, out])
+        # Later answers take precedence, so a test can override a default.
+        self.table.insert(0, [pattern, code, out])
 
     def file(self, path, data):
         full = os.path.join(self.root, path.lstrip("/"))
@@ -83,6 +84,7 @@ class Scenario(object):
     def dpkg(self, path, package, version, doc_text=None, doc_pkg=None):
         self.answer("dpkg-query -S %s" % path, "%s: %s\n" % (package, path))
         self.answer("dpkg-query -W -f=${Version} %s" % package, version)
+        self.answer("dpkg --verify %s" % package, "")
         if doc_text is not None:
             self.file("/usr/share/doc/%s/changelog.Debian.gz" % (doc_pkg or package), gzip.compress(doc_text.encode()))
             if doc_pkg:
@@ -176,6 +178,18 @@ class HostTests(unittest.TestCase):
         i = self.item(self.s.run(), "/usr/bin/php8.3")
         self.assertEqual(i["status"], c.VULNERABLE)
         self.assertIn("differs", i["reason"])
+
+    def test_binary_that_cannot_be_verified_is_not_trusted(self):
+        self.noble("8.3.6-0ubuntu0.24.04.13", BOTH_CVES)
+        self.s.answer("dpkg --verify php8.3-cli", "", code=2)  # dpkg --verify failed to run
+        i = self.item(self.s.run(), "/usr/bin/php8.3")
+        self.assertEqual(i["status"], c.VULNERABLE)
+        self.assertIn("could not verify", i["reason"])
+
+    def test_binary_whose_digest_was_not_checked_is_not_trusted(self):
+        self.noble("8.3.6-0ubuntu0.24.04.13", BOTH_CVES)
+        self.s.answer("dpkg --verify php8.3-cli", "??????????   /usr/bin/php8.3\n", code=1)
+        self.assertEqual(self.item(self.s.run(), "/usr/bin/php8.3")["status"], c.VULNERABLE)
 
     def test_unknown_installed_version_is_not_trusted(self):
         self.s.php("/usr/bin/php8.3", "8.3.6")
@@ -360,6 +374,29 @@ class HostTests(unittest.TestCase):
         self.assertEqual(by["new-app"], {c.PATCHED})
         self.assertNotIn("proxy", by)
         self.assertEqual(r["exit_code"], 1)
+
+    def test_container_process_on_an_unchecked_file_takes_the_worse_verdict(self):
+        cid = "c" * 12
+        self.s.answer("docker ps --format *", "%s\tphp:8.4-fpm\tapp\n" % cid)
+        self.docker_container(cid, "php:8.4-fpm", "8.4.27", ["php-fpm: master process (/usr/local/etc/php-fpm.conf)"])
+        old = os.path.join(self._tmp, "outside", "php-fpm")
+        os.makedirs(os.path.dirname(old))
+        with open(old, "w") as f:
+            f.write("# X-Powered-By: PHP/8.4.26\n")
+        self.s.process(2001, "php-fpm", old, cgroup="0::/system.slice/docker-%s.scope\n" % ("c" * 64))
+        r = self.s.run(containers=True, processes=True)
+        self.assertEqual(set(i["status"] for i in r["containers"]), {c.PATCHED})
+        self.assertEqual(r["processes"][0]["status"], c.VULNERABLE)
+        self.assertEqual(r["exit_code"], 1)
+
+    def test_container_process_on_the_checked_path_inherits_it(self):
+        cid = "d" * 12
+        self.s.answer("docker ps --format *", "%s\tphp:8.4-fpm\tapp\n" % cid)
+        self.docker_container(cid, "php:8.4-fpm", "8.4.27", ["php-fpm: master process (/usr/local/etc/php-fpm.conf)"])
+        self.s.process(2002, "php-fpm", "/usr/local/sbin/php-fpm", cgroup="0::/system.slice/docker-%s.scope\n" % ("d" * 64))
+        r = self.s.run(containers=True, processes=True)
+        self.assertEqual(r["processes"][0]["status"], c.PATCHED)
+        self.assertEqual(r["exit_code"], 0)
 
     def test_container_process_without_a_matching_binary_is_unknown(self):
         s = self.s

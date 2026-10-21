@@ -26,7 +26,14 @@ class ClassifyUpstream(unittest.TestCase):
     def test_distro_suffix_is_not_a_prerelease(self):
         # Ubuntu 18.04 builds report PHP_VERSION with the package suffix.
         self.check("7.2.24-0ubuntu0.18.04.17", c.VULNERABLE)
+        self.check("7.0.33-0+deb9u12", c.VULNERABLE)
         self.check("8.4.27-1+ubuntu24.04.1+deb.sury.org+1", c.PATCHED)
+        self.check("8.4.27-8.el8_10", c.PATCHED)
+
+    def test_unknown_or_crafted_suffixes_are_unknown(self):
+        for v in ("8.4.27+evil", "8.4.27+", "8.4.27-0ubuntu0.24.04.1~rc1", "8.4.27-1+deb.sury.org+1-dev",
+                  "8.4.27-1+ubuntu24.04.1+deb.sury.org+1x", "8.4.27-0ubuntu1 extra", "8.4.27-1"):
+            self.check(v, c.UNKNOWN)
 
     def test_prereleases_and_partial_versions_are_unknown(self):
         for v in ("8.6.0RC3", "8.4.27-dev", "8.5.12alpha1", "8.4.27~rc1", "8.4.27.rc1", "8.4.27RC1",

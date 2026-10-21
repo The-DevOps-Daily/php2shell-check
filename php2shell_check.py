@@ -66,9 +66,15 @@ NAME_RE = re.compile(r"^(php[0-9.]*(-fpm|-cgi)?[0-9.]*|lsphp[0-9.]*|frankenphp)$
 PROC_RE = re.compile(r"(^|/)(php[0-9.]*(-fpm|-cgi)?[0-9.]*|lsphp[0-9.]*|frankenphp|apache2|httpd)(\s|:|$)")
 VERSION_STRING_RE = re.compile(rb"X-Powered-By: PHP/([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.~+-]*)")
 DASH_V_RE = re.compile(r"(?m)^(?:PHP|FrankenPHP \S+ PHP) ([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.~+-]*)")
-PRERELEASE_RE = re.compile(r"(?i)^[-~._]?(dev|alpha|beta|rc|a[0-9]|b[0-9])")
-# Suffixes distributions append to PHP_VERSION, e.g. -0ubuntu0.18.04.17 or +deb12u1.
-DISTRO_SUFFIX_RE = re.compile(r"^([-+~][0-9]|\+|-[0-9A-Za-z.+~]*(ubuntu|deb|el[0-9]|sury))")
+PRERELEASE_RE = re.compile(r"(?i)(dev|alpha|beta|rc)[0-9]*|^[-~._]?[ab][0-9]")
+# The only suffixes accepted after x.y.z: package versions that distributions
+# compile into PHP_VERSION. Anything else is reported as unknown.
+DISTRO_SUFFIXES = [
+    re.compile(r"-[0-9]+ubuntu[0-9.]+(\+esm[0-9]+)?"),                       # -0ubuntu0.18.04.17
+    re.compile(r"-[0-9]+\+deb[0-9]+u[0-9]+"),                                # -0+deb9u12
+    re.compile(r"-[0-9]+\+(ubuntu[0-9.]+|deb[0-9]+)\+deb\.sury\.org\+[0-9]+"),  # -1+ubuntu24.04.1+deb.sury.org+1
+    re.compile(r"-[0-9]+(\.[0-9]+)*\.el[0-9]+(_[0-9]+)?"),                     # -8.el8_10
+]
 CONTAINER_ID_RE = re.compile(r"([0-9a-f]{64})")
 
 
@@ -87,9 +93,9 @@ def classify_upstream(version_text):
     version, suffix = parse_version(version_text)
     if version is None:
         return UNKNOWN, "no PHP version found"
-    if PRERELEASE_RE.match(suffix):
+    if suffix and PRERELEASE_RE.search(suffix):
         return UNKNOWN, "pre-release build %s: check the commit it was built from" % version_text
-    if suffix and not DISTRO_SUFFIX_RE.match(suffix):
+    if suffix and not any(p.fullmatch(suffix) for p in DISTRO_SUFFIXES):
         return UNKNOWN, "unrecognised version suffix in %s" % version_text
     branch = version[:2]
     if branch in FIXED:
@@ -349,13 +355,18 @@ def file_matches_package(runner, manager, pkg, path):
         rc, out, _ = runner.run(["rpm", "-Vf", path])
     else:
         return None
-    if rc not in (0, 1):
+    if rc not in (0, 1) or (rc == 1 and not out.strip()):
         return None
+    # Both tools print one line per file that failed a check; the third flag
+    # is the digest: '5' = differs, '?' = could not be checked.
     for line in out.decode("utf-8", "replace").splitlines():
         parts = line.split()
-        if parts and parts[-1] == path and "5" in parts[0]:
-            return False
-    return True if rc == 0 or out else None
+        if parts and parts[-1] == path and len(parts[0]) >= 3:
+            if parts[0][2] == "5":
+                return False
+            if parts[0][2] == "?":
+                return None
+    return True
 
 
 def changelog_hits(text):
@@ -402,8 +413,10 @@ def package_evidence(runner, path):
             if not top or top != version:
                 ev["note"] = "changelog top entry %s does not match installed %s" % (top or "?", version)
                 return ev
-            if file_matches_package(runner, "dpkg", pkg, path) is False:
-                ev["note"] = "%s differs from the %s package (dpkg --verify)" % (path, pkg)
+            verified = file_matches_package(runner, "dpkg", pkg, path)
+            if verified is not True:
+                ev["note"] = ("%s differs from the %s package (dpkg --verify)" if verified is False else
+                              "could not verify %s against the %s package (dpkg --verify)") % (path, pkg)
                 return ev
             ev["trusted"] = True
             return ev
@@ -422,8 +435,10 @@ def package_evidence(runner, path):
             ev["note"] = "rpm changelog not readable"
             return ev
         ev["hits"] = changelog_hits(log.decode("utf-8", "replace"))
-        if file_matches_package(runner, "rpm", name, path) is False:
-            ev["note"] = "%s differs from the %s package (rpm -V)" % (path, name)
+        verified = file_matches_package(runner, "rpm", name, path)
+        if verified is not True:
+            ev["note"] = ("%s differs from the %s package (rpm -V)" if verified is False else
+                          "could not verify %s against the %s package (rpm -V)") % (path, name)
             return ev
         ev["trusted"] = True
         return ev
@@ -737,10 +752,24 @@ def resolve_processes(report, groups, denied, root, containers_checked):
             entry["reason"] = "could not read the cgroup: host or container unknown"
         elif g["container"]:
             items = [i for cid, lst in by_container.items() if cid.startswith(g["container"]) for i in lst]
-            if items:
-                worst = max(items, key=lambda i: WORST.get(i["status"], 1))
+            running = g["libphp"] or (g["exe"] or "").replace(" (deleted)", "")
+            same = [i for i in items if i.get("path") == running]
+            if same:
+                # The container check looked at the file this process runs.
+                worst = max(same, key=lambda i: WORST.get(i["status"], 1))
                 entry["status"] = worst["status"]
-                entry["reason"] = "container check: %s" % worst["reason"]
+                entry["reason"] = "container check of %s: %s" % (running, worst["reason"])
+            elif items:
+                # Not the file that was checked: take the worse of the
+                # container's results and this process's own version.
+                worst = max(items, key=lambda i: WORST.get(i["status"], 1))
+                if WORST.get(observed, 1) > WORST.get(worst["status"], 1):
+                    entry["status"] = observed
+                    entry["reason"] = "%s (version read from /proc; %s was not checked in the container)" % (
+                        observed_reason, running)
+                else:
+                    entry["status"] = worst["status"]
+                    entry["reason"] = "container check: %s" % worst["reason"]
             elif g.get("version"):
                 entry["status"] = observed
                 entry["reason"] = "%s (version read from /proc; container not checked%s)" % (
