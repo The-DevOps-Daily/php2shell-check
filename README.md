@@ -54,10 +54,11 @@ Each run is saved to `results/scan-<UTC start time>.json` with the hash of the c
 | Run (UTC) | Hours after the scheduled 14:00 UTC release | Patched | Vulnerable | Unknown |
 |---|---|---|---|---|
 | 18:21 | 4.4 | 29 | 8 | 2 |
+| 19:32 | 5.5 | 34 | 3 | 2 |
 
-Still vulnerable at 18:21 UTC: `php:8.1-fpm` and `php:8.1-apache` (8.1.34, end of life, last built December 2025), `joomla:latest` (8.4.26), `nextcloud:latest` and `nextcloud:fpm` (8.5.11), `phpmyadmin:latest` (8.3.35), `yourls:latest` (8.5.11) and `laravelsail/php84-composer:latest` (8.4.1, built November 2024). The official `php` images for 8.2 to 8.5 were built 1.8 to 2.1 hours after the scheduled release.
+Still vulnerable at 18:21 UTC: `php:8.1-fpm` and `php:8.1-apache` (8.1.34, end of life, last built December 2025), `joomla:latest` (8.4.26), `nextcloud:latest` and `nextcloud:fpm` (8.5.11), `phpmyadmin:latest` (8.3.35), `yourls:latest` (8.5.11) and `laravelsail/php84-composer:latest` (8.4.1, built November 2024). At 19:32 UTC only the two `php:8.1` tags and `laravelsail/php84-composer:latest` were left. The official `php` images for 8.2 to 8.5 were built 1.8 to 2.1 hours after the scheduled release.
 
-`joomla:latest` shows why a push time is not enough: Docker Hub lists the tag as pushed at 15:46 UTC, after the release, but its amd64 image config was built at 01:52 UTC with PHP 8.4.26. `nextcloud:latest` and `nextcloud:fpm` looked the same at 18:21 and had moved to 8.5.12 by 18:30 (`results/method-check-20261021T183037Z.txt`).
+`joomla:latest` shows why a push time is not enough: Docker Hub lists the tag as pushed at 15:46 UTC, after the release, but its amd64 image config was built at 01:52 UTC with PHP 8.4.26. `nextcloud:latest` and `nextcloud:fpm` looked the same at 18:21 and had moved to 8.5.12 by 18:30 (`results/method-check-20261021T183037Z.txt`). A build time is not enough either: the fixed `joomla`, `phpmyadmin` and `yourls` amd64 images served at 19:32 were built at 16:28 to 16:36 UTC, but the registry still served the old ones at 18:30.
 
 ### This host
 
