@@ -1,0 +1,47 @@
+{
+  "tool": "php2shell-check",
+  "fixed": {
+    "8.2": "8.2.35",
+    "8.3": "8.3.36",
+    "8.4": "8.4.27",
+    "8.5": "8.5.12"
+  },
+  "items": [
+    {
+      "where": "host",
+      "path": "/usr/bin/php8.4",
+      "sapi": "cli",
+      "exposure": "CLI: not a web SAPI unless it runs `php -S`; same package line often ships FPM/mod_php",
+      "version_source": "embedded string",
+      "version": "8.4.23",
+      "package": {
+        "manager": "dpkg",
+        "package": "php8.4-cli",
+        "version": "8.4.23-1+0~20260703.52+debian12~1.gbp817a0c",
+        "hits": [],
+        "trusted": true
+      },
+      "status": "vulnerable",
+      "reason": "upstream 8.4.23 < 8.4.27",
+      "ini": {
+        "source": "php8.4 -i",
+        "loaded_ini": "/etc/php/8.4/cli/php.ini",
+        "session.upload_progress.enabled": "On",
+        "memory_limit": "-1",
+        "post_max_size": "8M"
+      },
+      "aliases": [
+        "/bin/php",
+        "/bin/php8.4",
+        "/usr/bin/php"
+      ]
+    }
+  ],
+  "processes": [],
+  "notes": [
+    "no docker or podman CLI found; container processes are still listed under processes"
+  ],
+  "server_overrides": [],
+  "containers": [],
+  "exit_code": 1
+}

@@ -1,0 +1,24 @@
+# 2026-10-21T18:26:09Z Raspberry Pi, Debian 12, PHP CLI from packages.sury.org, no web server, run as a normal user
+$ python3 php2shell_check.py
+php2shell-check: fixed releases 8.2.35, 8.3.36, 8.4.27, 8.5.12
+
+PHP on disk
+  [vulnerable]   /usr/bin/php8.4                    cli
+      version: 8.4.23 (embedded string)
+      exposure: CLI: not a web SAPI unless it runs `php -S`; same package line often ships FPM/mod_php
+      also as: /bin/php, /bin/php8.4, /usr/bin/php
+      package: php8.4-cli 8.4.23-1+0~20260703.52+debian12~1.gbp817a0c (dpkg); CVE IDs in changelog: none
+      why: upstream 8.4.23 < 8.4.27
+      session.upload_progress.enabled: On  [php8.4 -i]
+      memory_limit=-1  post_max_size=8M
+
+Running PHP processes
+  none
+
+Containers
+  none checked
+note: no docker or podman CLI found; container processes are still listed under processes
+
+result: VULNERABLE or restart needed (exit 1)
+$ echo $?
+1

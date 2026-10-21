@@ -1,0 +1,14 @@
+# 2026-10-21T18:26:56Z Ubuntu 24.04 php8.3 packages from http://archive.ubuntu.com/ubuntu/pool
+sha256 60187aae56db2056e916d99ba4854415993429f12732ace1b5eb5225bb33f584  php8.3-fpm_8.3.6-0ubuntu0.24.04.12_amd64.deb
+sha256 85e4fc03ff84fef7dfed923c99d1a2e0e6f49147a50bcd5eaca4e7cd05a835fa  php8.3-common_8.3.6-0ubuntu0.24.04.12_amd64.deb
+sha256 ae395e2c15c3b96da56da807a204f771a589eb5bf54a3e5e239b1f50ade2815b  php8.3-fpm_8.3.6-0ubuntu0.24.04.13_amd64.deb
+sha256 801cae4e842e1b9e9d60a542bf18ba831bf504b2f3070404892bf3f8fb943ea4  php8.3-common_8.3.6-0ubuntu0.24.04.13_amd64.deb
+
+package 8.3.6-0ubuntu0.24.04.12
+  php-fpm8.3 embeds: PHP/8.3.6
+  changelog top:     php8.3 (8.3.6-0ubuntu0.24.04.12) noble-security; urgency=medium
+  PHP2Shell IDs:     none
+package 8.3.6-0ubuntu0.24.04.13
+  php-fpm8.3 embeds: PHP/8.3.6
+  changelog top:     php8.3 (8.3.6-0ubuntu0.24.04.13) noble-security; urgency=medium
+  PHP2Shell IDs:     CVE-2026-109618 CVE-2026-109619 

@@ -1,0 +1,51 @@
+# Images scanned by registry_scan.py, linux/amd64 only.
+# Picked to cover the official php image (the base most others build FROM),
+# the official application images built on it, and widely pulled community
+# images, including ones that install PHP another way.
+
+## Official php image, supported branches
+php:8.5-fpm            # FPM variant, newest branch
+php:8.5-apache         # Apache + mod_php, the highest-risk SAPI per php.net
+php:8.5-cli            # CLI only; same build as the web variants
+php:8.5-fpm-alpine     # Alpine variant
+php:8.4-fpm
+php:8.4-apache
+php:8.4-cli
+php:8.4-fpm-alpine
+php:8.4-zts            # thread-safe build, the base FrankenPHP uses
+php:8.3-fpm
+php:8.3-apache
+php:8.3-cli
+php:8.3-fpm-alpine
+php:8.2-fpm            # 8.2 gets security fixes until 31 Dec 2026
+php:8.2-apache
+php:8.2-cli
+
+## Official php image, end-of-life branch (no upstream fix)
+php:8.1-fpm
+php:8.1-apache
+
+## Official application images (built FROM php)
+wordpress:latest       # mod_php
+wordpress:fpm
+wordpress:cli
+drupal:latest
+joomla:latest
+mediawiki:latest
+nextcloud:latest
+nextcloud:fpm
+matomo:latest
+phpmyadmin:latest
+composer:latest        # build-time tool, often copied into app images
+adminer:latest
+yourls:latest
+
+## Community images
+dunglas/frankenphp:latest           # FrankenPHP, named as affected by php.net
+serversideup/php:8.4-fpm-nginx      # popular Laravel production base
+serversideup/php:8.3-fpm-apache
+webdevops/php-nginx:8.4
+thecodingmachine/php:8.4-v5-fpm
+bitnami/php-fpm:latest              # Bitnami sets APP_VERSION, not PHP_VERSION
+laravelsail/php84-composer:latest   # used in the Laravel docs to run composer
+linuxserver/nextcloud:latest        # Alpine packages, no PHP version in metadata
